@@ -8,20 +8,23 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/containers/storage/drivers"
+	graphdriver "github.com/containers/storage/drivers"
 	"github.com/containers/storage/pkg/archive"
+	"github.com/containers/storage/pkg/directory"
 	"github.com/containers/storage/pkg/idtools"
-	"github.com/containers/storage/pkg/ostree"
 	"github.com/containers/storage/pkg/parsers"
 	"github.com/containers/storage/pkg/system"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/sirupsen/logrus"
+	"github.com/vbatts/tar-split/tar/storage"
 )
 
 var (
 	// CopyDir defines the copy method to use.
 	CopyDir = dirCopy
 )
+
+const defaultPerms = os.FileMode(0555)
 
 func init() {
 	graphdriver.Register("vfs", Init)
@@ -51,11 +54,6 @@ func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) 
 		case "vfs.imagestore", ".imagestore":
 			d.homes = append(d.homes, strings.Split(val, ",")...)
 			continue
-		case "vfs.ostree_repo", ".ostree_repo":
-			if !ostree.OstreeSupport() {
-				return nil, fmt.Errorf("vfs: ostree_repo specified but support for ostree is missing")
-			}
-			d.ostreeRepo = val
 		case "vfs.mountopt":
 			return nil, fmt.Errorf("vfs driver does not support mount options")
 		case ".ignore_chown_errors", "vfs.ignore_chown_errors":
@@ -67,15 +65,6 @@ func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) 
 			}
 		default:
 			return nil, fmt.Errorf("vfs driver does not support %s options", key)
-		}
-	}
-	if d.ostreeRepo != "" {
-		rootUID, rootGID, err := idtools.GetRootUIDGID(options.UIDMaps, options.GIDMaps)
-		if err != nil {
-			return nil, err
-		}
-		if err := ostree.CreateOSTreeRepository(d.ostreeRepo, rootUID, rootGID); err != nil {
-			return nil, err
 		}
 	}
 	d.updater = graphdriver.NewNaiveLayerIDMapUpdater(d)
@@ -92,7 +81,6 @@ type Driver struct {
 	name              string
 	homes             []string
 	idMappings        *idtools.IDMappings
-	ostreeRepo        string
 	ignoreChownErrors bool
 	naiveDiff         graphdriver.DiffDriver
 	updater           graphdriver.LayerIDMapUpdater
@@ -115,6 +103,21 @@ func (d *Driver) Metadata(id string) (map[string]string, error) {
 // Cleanup is used to implement graphdriver.ProtoDriver. There is no cleanup required for this driver.
 func (d *Driver) Cleanup() error {
 	return nil
+}
+
+type fileGetNilCloser struct {
+	storage.FileGetter
+}
+
+func (f fileGetNilCloser) Close() error {
+	return nil
+}
+
+// DiffGetter returns a FileGetCloser that can read files from the directory that
+// contains files for the layer differences. Used for direct access for tar-split.
+func (d *Driver) DiffGetter(id string) (graphdriver.FileGetCloser, error) {
+	p := d.dir(id)
+	return fileGetNilCloser{storage.NewPathFileGetter(p)}, nil
 }
 
 // CreateFromTemplate creates a layer with the same contents and parent as another layer.
@@ -166,15 +169,17 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts, ro bool
 		}
 	}()
 
+	rootPerms := defaultPerms
 	if parent != "" {
 		st, err := system.Stat(d.dir(parent))
 		if err != nil {
 			return err
 		}
+		rootPerms = os.FileMode(st.Mode())
 		rootIDs.UID = int(st.UID())
 		rootIDs.GID = int(st.GID())
 	}
-	if err := idtools.MkdirAndChown(dir, 0755, rootIDs); err != nil {
+	if err := idtools.MkdirAndChown(dir, rootPerms, rootIDs); err != nil {
 		return err
 	}
 	labelOpts := []string{"level:s0"}
@@ -191,11 +196,6 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts, ro bool
 		}
 	}
 
-	if ro && d.ostreeRepo != "" {
-		if err := ostree.ConvertToOSTree(d.ostreeRepo, dir, id); err != nil {
-			return err
-		}
-	}
 	return nil
 
 }
@@ -216,10 +216,6 @@ func (d *Driver) dir(id string) string {
 
 // Remove deletes the content from the directory for a given id.
 func (d *Driver) Remove(id string) error {
-	if d.ostreeRepo != "" {
-		// Ignore errors, we don't want to fail if the ostree branch doesn't exist,
-		ostree.DeleteOSTree(d.ostreeRepo, id)
-	}
 	return system.EnsureRemoveAll(d.dir(id))
 }
 
@@ -250,6 +246,12 @@ func (d *Driver) Put(id string) error {
 	// The vfs driver has no runtime resources (e.g. mounts)
 	// to clean up, so we don't need anything here
 	return nil
+}
+
+// ReadWriteDiskUsage returns the disk usage of the writable directory for the ID.
+// For VFS, it queries the directory for this ID.
+func (d *Driver) ReadWriteDiskUsage(id string) (*directory.DiskUsage, error) {
+	return directory.Usage(d.dir(id))
 }
 
 // Exists checks to see if the directory exists for the given id.

@@ -15,6 +15,8 @@
 package process
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"time"
@@ -22,7 +24,6 @@ import (
 	"github.com/containers/psgo/internal/host"
 	"github.com/containers/psgo/internal/proc"
 	"github.com/opencontainers/runc/libcontainer/user"
-	"github.com/pkg/errors"
 )
 
 // Process includes process-related from the /proc FS.
@@ -31,9 +32,9 @@ type Process struct {
 	Pid string
 	// Stat contains data from /proc/$pid/stat.
 	Stat proc.Stat
-	// Status containes data from /proc/$pid/status.
+	// Status contains data from /proc/$pid/status.
 	Status proc.Status
-	// CmdLine containes data from /proc/$pid/cmdline.
+	// CmdLine contains data from /proc/$pid/cmdline.
 	CmdLine []string
 	// Label containers data from /proc/$pid/attr/current.
 	Label string
@@ -50,7 +51,7 @@ type Process struct {
 func LookupGID(gid string) (string, error) {
 	gidNum, err := strconv.Atoi(gid)
 	if err != nil {
-		return "", errors.Wrap(err, "error parsing group ID")
+		return "", fmt.Errorf("error parsing group ID: %w", err)
 	}
 	g, err := user.LookupGid(gidNum)
 	if err != nil {
@@ -64,7 +65,7 @@ func LookupGID(gid string) (string, error) {
 func LookupUID(uid string) (string, error) {
 	uidNum, err := strconv.Atoi(uid)
 	if err != nil {
-		return "", errors.Wrap(err, "error parsing user ID")
+		return "", fmt.Errorf("error parsing user ID: %w", err)
 	}
 	u, err := user.LookupUid(uidNum)
 	if err != nil {
@@ -107,7 +108,7 @@ func FromPIDs(pids []string, joinUserNS bool) ([]*Process, error) {
 	for _, pid := range pids {
 		p, err := New(pid, joinUserNS)
 		if err != nil {
-			if os.IsNotExist(errors.Cause(err)) {
+			if errors.Is(err, os.ErrNotExist) {
 				// proc parsing is racy
 				// Let's ignore "does not exist" errors
 				continue
@@ -188,26 +189,33 @@ func (p *Process) SetHostData() error {
 
 // ElapsedTime returns the time.Duration since process p was created.
 func (p *Process) ElapsedTime() (time.Duration, error) {
-	sinceBoot, err := strconv.ParseInt(p.Stat.Starttime, 10, 64)
+	startTime, err := p.StartTime()
 	if err != nil {
 		return 0, err
+	}
+	return time.Since(startTime), nil
+}
+
+// StarTime returns the time.Time when process p was started.
+func (p *Process) StartTime() (time.Time, error) {
+	sinceBoot, err := strconv.ParseInt(p.Stat.Starttime, 10, 64)
+	if err != nil {
+		return time.Time{}, err
 	}
 	clockTicks, err := host.ClockTicks()
 	if err != nil {
-		return 0, err
+		return time.Time{}, err
+	}
+	bootTime, err := host.BootTime()
+	if err != nil {
+		return time.Time{}, err
 	}
 
 	sinceBoot = sinceBoot / clockTicks
-
-	bootTime, err := host.BootTime()
-	if err != nil {
-		return 0, err
-	}
-	created := time.Unix(sinceBoot+bootTime, 0)
-	return (time.Now()).Sub(created), nil
+	return time.Unix(sinceBoot+bootTime, 0), nil
 }
 
-// CPUTime returns the cumlative CPU time of process p as a time.Duration.
+// CPUTime returns the cumulative CPU time of process p as a time.Duration.
 func (p *Process) CPUTime() (time.Duration, error) {
 	user, err := strconv.ParseInt(p.Stat.Utime, 10, 64)
 	if err != nil {

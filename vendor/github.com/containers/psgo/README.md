@@ -73,8 +73,12 @@ The ps library is compatible with all AIX format descriptors of the ps command-l
   - Set of inheritable capabilities. See capabilities(7) for more information.
 - **capprm**
   - Set of permitted capabilities. See capabilities(7) for more information.
+- **groups**
+  - Supplmentary groups inside the container.
 - **hgroup**
   - The corresponding effective group of a container process on the host.
+- **hgroups**
+  - Supplmentary groups on the host.
 - **hpid**
   - The corresponding host PID of a container process.
 - **huser**
@@ -85,6 +89,8 @@ The ps library is compatible with all AIX format descriptors of the ps command-l
   - Seccomp mode of the process (i.e., disabled, strict or filter). See seccomp(2) for more information.
 - **state**
   - Process state codes (e.g, **R** for *running*, **S** for *sleeping*). See proc(5) for more information.
+- **stime**
+  - Process start time (e.g, "2019-12-09 10:50:36 +0100 CET).
 
 We can try out different format descriptors with the psgo binary:
 
