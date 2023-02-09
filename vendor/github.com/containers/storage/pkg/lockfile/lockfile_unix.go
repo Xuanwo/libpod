@@ -5,6 +5,7 @@ package lockfile
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -33,11 +34,30 @@ type lockfile struct {
 // descriptor.  Note that the path is opened read-only when ro is set.  If ro
 // is unset, openLock will open the path read-write and create the file if
 // necessary.
-func openLock(path string, ro bool) (int, error) {
+func openLock(path string, ro bool) (fd int, err error) {
 	if ro {
-		return unix.Open(path, os.O_RDONLY, 0)
+		fd, err = unix.Open(path, os.O_RDONLY|unix.O_CLOEXEC|os.O_CREATE, 0)
+	} else {
+		fd, err = unix.Open(path,
+			os.O_RDWR|unix.O_CLOEXEC|os.O_CREATE,
+			unix.S_IRUSR|unix.S_IWUSR|unix.S_IRGRP|unix.S_IROTH,
+		)
 	}
-	return unix.Open(path, os.O_RDWR|os.O_CREATE, unix.S_IRUSR|unix.S_IWUSR)
+
+	if err == nil {
+		return
+	}
+
+	// the directory of the lockfile seems to be removed, try to create it
+	if os.IsNotExist(err) {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			return fd, errors.Wrap(err, "creating locker directory")
+		}
+
+		return openLock(path, ro)
+	}
+
+	return
 }
 
 // createLockerForPath returns a Locker object, possibly (depending on the platform)
@@ -77,14 +97,14 @@ func createLockerForPath(path string, ro bool) (Locker, error) {
 
 // lock locks the lockfile via FCTNL(2) based on the specified type and
 // command.
-func (l *lockfile) lock(l_type int16, recursive bool) {
+func (l *lockfile) lock(lType int16, recursive bool) {
 	lk := unix.Flock_t{
-		Type:   l_type,
+		Type:   lType,
 		Whence: int16(os.SEEK_SET),
 		Start:  0,
 		Len:    0,
 	}
-	switch l_type {
+	switch lType {
 	case unix.F_RDLCK:
 		l.rwMutex.RLock()
 	case unix.F_WRLCK:
@@ -96,7 +116,7 @@ func (l *lockfile) lock(l_type int16, recursive bool) {
 			l.rwMutex.Lock()
 		}
 	default:
-		panic(fmt.Sprintf("attempted to acquire a file lock of unrecognized type %d", l_type))
+		panic(fmt.Sprintf("attempted to acquire a file lock of unrecognized type %d", lType))
 	}
 	l.stateMutex.Lock()
 	defer l.stateMutex.Unlock()
@@ -104,9 +124,8 @@ func (l *lockfile) lock(l_type int16, recursive bool) {
 		// If we're the first reference on the lock, we need to open the file again.
 		fd, err := openLock(l.file, l.ro)
 		if err != nil {
-			panic(fmt.Sprintf("error opening %q", l.file))
+			panic(fmt.Sprintf("error opening %q: %v", l.file, err))
 		}
-		unix.CloseOnExec(fd)
 		l.fd = uintptr(fd)
 
 		// Optimization: only use the (expensive) fcntl syscall when
@@ -116,7 +135,7 @@ func (l *lockfile) lock(l_type int16, recursive bool) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
-	l.locktype = l_type
+	l.locktype = lType
 	l.locked = true
 	l.recursive = recursive
 	l.counter++
@@ -192,23 +211,15 @@ func (l *lockfile) Touch() error {
 	if !l.locked || (l.locktype != unix.F_WRLCK) {
 		panic("attempted to update last-writer in lockfile without the write lock")
 	}
-	l.stateMutex.Unlock()
+	defer l.stateMutex.Unlock()
 	l.lw = stringid.GenerateRandomID()
 	id := []byte(l.lw)
-	_, err := unix.Seek(int(l.fd), 0, os.SEEK_SET)
-	if err != nil {
-		return err
-	}
-	n, err := unix.Write(int(l.fd), id)
+	n, err := unix.Pwrite(int(l.fd), id, 0)
 	if err != nil {
 		return err
 	}
 	if n != len(id) {
 		return unix.ENOSPC
-	}
-	err = unix.Fsync(int(l.fd))
-	if err != nil {
-		return err
 	}
 	return nil
 }
@@ -216,17 +227,13 @@ func (l *lockfile) Touch() error {
 // Modified indicates if the lockfile has been updated since the last time it
 // was loaded.
 func (l *lockfile) Modified() (bool, error) {
-	id := []byte(l.lw)
 	l.stateMutex.Lock()
+	id := []byte(l.lw)
 	if !l.locked {
 		panic("attempted to check last-writer in lockfile without locking it first")
 	}
-	l.stateMutex.Unlock()
-	_, err := unix.Seek(int(l.fd), 0, os.SEEK_SET)
-	if err != nil {
-		return true, err
-	}
-	n, err := unix.Read(int(l.fd), id)
+	defer l.stateMutex.Unlock()
+	n, err := unix.Pread(int(l.fd), id, 0)
 	if err != nil {
 		return true, err
 	}
