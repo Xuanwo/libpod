@@ -148,10 +148,20 @@ func (c *Container) ProcessLabel() string {
 }
 
 func (c *Container) MountOpts() []string {
-	if mountOpts, ok := c.Flags["MountOpts"].([]string); ok {
+	switch c.Flags["MountOpts"].(type) {
+	case []string:
+		return c.Flags["MountOpts"].([]string)
+	case []interface{}:
+		var mountOpts []string
+		for _, v := range c.Flags["MountOpts"].([]interface{}) {
+			if flag, ok := v.(string); ok {
+				mountOpts = append(mountOpts, flag)
+			}
+		}
 		return mountOpts
+	default:
+		return nil
 	}
-	return nil
 }
 
 func (r *containerStore) Containers() ([]Container, error) {
@@ -302,6 +312,9 @@ func (r *containerStore) Create(id string, names []string, image, layer, metadat
 	}
 	if options.MountOpts != nil {
 		options.Flags["MountOpts"] = append([]string{}, options.MountOpts...)
+	}
+	if options.Volatile {
+		options.Flags["Volatile"] = true
 	}
 	names = dedupeNames(names)
 	for _, name := range names {
