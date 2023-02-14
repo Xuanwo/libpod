@@ -18,6 +18,7 @@ import (
 	"github.com/containers/storage/pkg/archive"
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/pkg/ioutils"
+	"github.com/containers/storage/pkg/mount"
 	"github.com/containers/storage/pkg/stringid"
 	"github.com/containers/storage/pkg/system"
 	"github.com/containers/storage/pkg/tarlog"
@@ -116,6 +117,11 @@ type Layer struct {
 
 	// ReadOnly is true if this layer resides in a read-only layer store.
 	ReadOnly bool `json:"-"`
+
+	// BigDataNames is a list of names of data items that we keep for the
+	// convenience of the caller.  They can be large, and are only in
+	// memory when being read from or written to disk.
+	BigDataNames []string `json:"big-data-names,omitempty"`
 }
 
 type layerMountPoint struct {
@@ -136,6 +142,7 @@ type DiffOptions struct {
 type ROLayerStore interface {
 	ROFileBasedStore
 	ROMetadataStore
+	ROLayerBigDataStore
 
 	// Exists checks if a layer with the specified name or ID is known.
 	Exists(id string) bool
@@ -193,6 +200,7 @@ type LayerStore interface {
 	RWFileBasedStore
 	RWMetadataStore
 	FlaggableStore
+	RWLayerBigDataStore
 
 	// Create creates a new layer, optionally giving it a specified ID rather than
 	// a randomly-generated one, either inheriting data from another specified
@@ -238,6 +246,10 @@ type LayerStore interface {
 	// ApplyDiff reads a tarstream which was created by a previous call to Diff and
 	// applies its changes to a specified layer.
 	ApplyDiff(to string, diff io.Reader) (int64, error)
+
+	// LoadLocked wraps Load in a locked state. This means it loads the store
+	// and cleans-up invalid layers if needed.
+	LoadLocked() error
 }
 
 type layerStore struct {
@@ -273,9 +285,12 @@ func copyLayer(l *Layer) *Layer {
 		UncompressedSize:   l.UncompressedSize,
 		CompressionType:    l.CompressionType,
 		ReadOnly:           l.ReadOnly,
+		BigDataNames:       copyStringSlice(l.BigDataNames),
 		Flags:              copyStringInterfaceMap(l.Flags),
 		UIDMap:             copyIDMap(l.UIDMap),
 		GIDMap:             copyIDMap(l.GIDMap),
+		UIDs:               copyUint32Slice(l.UIDs),
+		GIDs:               copyUint32Slice(l.GIDs),
 	}
 }
 
@@ -345,6 +360,7 @@ func (r *layerStore) Load() error {
 	r.byname = names
 	r.bycompressedsum = compressedsums
 	r.byuncompressedsum = uncompressedsums
+
 	// Load and merge information about which layers are mounted, and where.
 	if r.IsReadWrite() {
 		r.mountsLockfile.RLock()
@@ -352,30 +368,38 @@ func (r *layerStore) Load() error {
 		if err = r.loadMounts(); err != nil {
 			return err
 		}
-	}
-	// Last step: if we're writable, try to remove anything that a previous
-	// user of this storage area marked for deletion but didn't manage to
-	// actually delete.
-	if r.IsReadWrite() && r.Locked() {
-		for _, layer := range r.layers {
-			if layer.Flags == nil {
-				layer.Flags = make(map[string]interface{})
-			}
-			if cleanup, ok := layer.Flags[incompleteFlag]; ok {
-				if b, ok := cleanup.(bool); ok && b {
-					err = r.Delete(layer.ID)
-					if err != nil {
-						break
+
+		// Last step: as we’re writable, try to remove anything that a previous
+		// user of this storage area marked for deletion but didn't manage to
+		// actually delete.
+		if r.Locked() {
+			for _, layer := range r.layers {
+				if layer.Flags == nil {
+					layer.Flags = make(map[string]interface{})
+				}
+				if cleanup, ok := layer.Flags[incompleteFlag]; ok {
+					if b, ok := cleanup.(bool); ok && b {
+						err = r.deleteInternal(layer.ID)
+						if err != nil {
+							break
+						}
+						shouldSave = true
 					}
-					shouldSave = true
 				}
 			}
 		}
 		if shouldSave {
-			return r.Save()
+			return r.saveLayers()
 		}
 	}
+
 	return err
+}
+
+func (r *layerStore) LoadLocked() error {
+	r.lockfile.Lock()
+	defer r.lockfile.Unlock()
+	return r.Load()
 }
 
 func (r *layerStore) loadMounts() error {
@@ -416,6 +440,16 @@ func (r *layerStore) loadMounts() error {
 }
 
 func (r *layerStore) Save() error {
+	r.mountsLockfile.Lock()
+	defer r.mountsLockfile.Unlock()
+	defer r.mountsLockfile.Touch()
+	if err := r.saveLayers(); err != nil {
+		return err
+	}
+	return r.saveMounts()
+}
+
+func (r *layerStore) saveLayers() error {
 	if !r.IsReadWrite() {
 		return errors.Wrapf(ErrStoreIsReadOnly, "not allowed to modify the layer store at %q", r.layerspath())
 	}
@@ -431,13 +465,7 @@ func (r *layerStore) Save() error {
 		return err
 	}
 	defer r.Touch()
-	if err := ioutils.AtomicWriteFile(rpath, jldata, 0600); err != nil {
-		return err
-	}
-	r.mountsLockfile.Lock()
-	defer r.mountsLockfile.Unlock()
-	defer r.mountsLockfile.Touch()
-	return r.saveMounts()
+	return ioutils.AtomicWriteFile(rpath, jldata, 0600)
 }
 
 func (r *layerStore) saveMounts() error {
@@ -471,7 +499,7 @@ func (r *layerStore) saveMounts() error {
 	return r.loadMounts()
 }
 
-func newLayerStore(rundir string, layerdir string, driver drivers.Driver, uidMap, gidMap []idtools.IDMap) (LayerStore, error) {
+func (s *store) newLayerStore(rundir string, layerdir string, driver drivers.Driver) (LayerStore, error) {
 	if err := os.MkdirAll(rundir, 0700); err != nil {
 		return nil, err
 	}
@@ -482,8 +510,6 @@ func newLayerStore(rundir string, layerdir string, driver drivers.Driver, uidMap
 	if err != nil {
 		return nil, err
 	}
-	lockfile.Lock()
-	defer lockfile.Unlock()
 	mountsLockfile, err := GetLockfile(filepath.Join(rundir, "mountpoints.lock"))
 	if err != nil {
 		return nil, err
@@ -497,8 +523,8 @@ func newLayerStore(rundir string, layerdir string, driver drivers.Driver, uidMap
 		byid:           make(map[string]*Layer),
 		bymount:        make(map[string]*Layer),
 		byname:         make(map[string]*Layer),
-		uidMap:         copyIDMap(uidMap),
-		gidMap:         copyIDMap(gidMap),
+		uidMap:         copyIDMap(s.uidMap),
+		gidMap:         copyIDMap(s.gidMap),
 	}
 	if err := rlstore.Load(); err != nil {
 		return nil, err
@@ -511,8 +537,6 @@ func newROLayerStore(rundir string, layerdir string, driver drivers.Driver) (ROL
 	if err != nil {
 		return nil, err
 	}
-	lockfile.RLock()
-	defer lockfile.Unlock()
 	rlstore := layerStore{
 		lockfile:       lockfile,
 		mountsLockfile: nil,
@@ -678,14 +702,15 @@ func (r *layerStore) Put(id string, parentLayer *Layer, names []string, mountLab
 	}
 	if err == nil {
 		layer = &Layer{
-			ID:         id,
-			Parent:     parent,
-			Names:      names,
-			MountLabel: mountLabel,
-			Created:    time.Now().UTC(),
-			Flags:      make(map[string]interface{}),
-			UIDMap:     copyIDMap(moreOptions.UIDMap),
-			GIDMap:     copyIDMap(moreOptions.GIDMap),
+			ID:           id,
+			Parent:       parent,
+			Names:        names,
+			MountLabel:   mountLabel,
+			Created:      time.Now().UTC(),
+			Flags:        make(map[string]interface{}),
+			UIDMap:       copyIDMap(moreOptions.UIDMap),
+			GIDMap:       copyIDMap(moreOptions.GIDMap),
+			BigDataNames: []string{},
 		}
 		r.layers = append(r.layers, layer)
 		r.idindex.Add(id)
@@ -756,7 +781,20 @@ func (r *layerStore) Mounted(id string) (int, error) {
 }
 
 func (r *layerStore) Mount(id string, options drivers.MountOpts) (string, error) {
-	if !r.IsReadWrite() {
+
+	// check whether options include ro option
+	hasReadOnlyOpt := func(opts []string) bool {
+		for _, item := range opts {
+			if item == "ro" {
+				return true
+			}
+		}
+		return false
+	}
+
+	// You are not allowed to mount layers from readonly stores if they
+	// are not mounted read/only.
+	if !r.IsReadWrite() && !hasReadOnlyOpt(options.Options) {
 		return "", errors.Wrapf(ErrStoreIsReadOnly, "not allowed to update mount locations for layers at %q", r.mountspath())
 	}
 	r.mountsLockfile.Lock()
@@ -772,8 +810,17 @@ func (r *layerStore) Mount(id string, options drivers.MountOpts) (string, error)
 		return "", ErrLayerUnknown
 	}
 	if layer.MountCount > 0 {
-		layer.MountCount++
-		return layer.MountPoint, r.saveMounts()
+		mounted, err := mount.Mounted(layer.MountPoint)
+		if err != nil {
+			return "", err
+		}
+		// If the container is not mounted then we have a condition
+		// where the kernel umounted the mount point. This means
+		// that the mount count never got decremented.
+		if mounted {
+			layer.MountCount++
+			return layer.MountPoint, r.saveMounts()
+		}
 	}
 	if options.MountLabel == "" {
 		options.MountLabel = layer.MountLabel
@@ -869,11 +916,11 @@ func (r *layerStore) ParentOwners(id string) (uids, gids []int, err error) {
 	for dir := filepath.Dir(layer.MountPoint); dir != "" && dir != string(os.PathSeparator); dir = filepath.Dir(dir) {
 		st, err := system.Stat(dir)
 		if err != nil {
-			return nil, nil, errors.Wrapf(err, "error reading ownership of directory %q", dir)
+			return nil, nil, errors.Wrap(err, "read directory ownership")
 		}
 		lst, err := system.Lstat(dir)
 		if err != nil {
-			return nil, nil, errors.Wrapf(err, "error reading ownership of directory-in-case-it's-a-symlink %q", dir)
+			return nil, nil, err
 		}
 		fsuid := int(st.UID())
 		fsgid := int(st.GID())
@@ -932,6 +979,80 @@ func (r *layerStore) SetNames(id string, names []string) error {
 	return ErrLayerUnknown
 }
 
+func (r *layerStore) datadir(id string) string {
+	return filepath.Join(r.layerdir, id)
+}
+
+func (r *layerStore) datapath(id, key string) string {
+	return filepath.Join(r.datadir(id), makeBigDataBaseName(key))
+}
+
+func (r *layerStore) BigData(id, key string) (io.ReadCloser, error) {
+	if key == "" {
+		return nil, errors.Wrapf(ErrInvalidBigDataName, "can't retrieve layer big data value for empty name")
+	}
+	layer, ok := r.lookup(id)
+	if !ok {
+		return nil, errors.Wrapf(ErrLayerUnknown, "error locating layer with ID %q", id)
+	}
+	return os.Open(r.datapath(layer.ID, key))
+}
+
+func (r *layerStore) SetBigData(id, key string, data io.Reader) error {
+	if key == "" {
+		return errors.Wrapf(ErrInvalidBigDataName, "can't set empty name for layer big data item")
+	}
+	if !r.IsReadWrite() {
+		return errors.Wrapf(ErrStoreIsReadOnly, "not allowed to save data items associated with layers at %q", r.layerspath())
+	}
+	layer, ok := r.lookup(id)
+	if !ok {
+		return errors.Wrapf(ErrLayerUnknown, "error locating layer with ID %q to write bigdata", id)
+	}
+	err := os.MkdirAll(r.datadir(layer.ID), 0700)
+	if err != nil {
+		return err
+	}
+
+	// NewAtomicFileWriter doesn't overwrite/truncate the existing inode.
+	// BigData() relies on this behaviour when opening the file for read
+	// so that it is either accessing the old data or the new one.
+	writer, err := ioutils.NewAtomicFileWriter(r.datapath(layer.ID, key), 0600)
+	if err != nil {
+		return errors.Wrapf(err, "error opening bigdata file")
+	}
+
+	if _, err := io.Copy(writer, data); err != nil {
+		writer.Close()
+		return errors.Wrapf(err, "error copying bigdata for the layer")
+
+	}
+	if err := writer.Close(); err != nil {
+		return errors.Wrapf(err, "error closing bigdata file for the layer")
+	}
+
+	addName := true
+	for _, name := range layer.BigDataNames {
+		if name == key {
+			addName = false
+			break
+		}
+	}
+	if addName {
+		layer.BigDataNames = append(layer.BigDataNames, key)
+		return r.Save()
+	}
+	return nil
+}
+
+func (r *layerStore) BigDataNames(id string) ([]string, error) {
+	layer, ok := r.lookup(id)
+	if !ok {
+		return nil, errors.Wrapf(ErrImageUnknown, "error locating layer with ID %q to retrieve bigdata names", id)
+	}
+	return copyStringSlice(layer.BigDataNames), nil
+}
+
 func (r *layerStore) Metadata(id string) (string, error) {
 	if layer, ok := r.lookup(id); ok {
 		return layer.Metadata, nil
@@ -954,7 +1075,7 @@ func (r *layerStore) tspath(id string) string {
 	return filepath.Join(r.layerdir, id+tarSplitSuffix)
 }
 
-func (r *layerStore) Delete(id string) error {
+func (r *layerStore) deleteInternal(id string) error {
 	if !r.IsReadWrite() {
 		return errors.Wrapf(ErrStoreIsReadOnly, "not allowed to delete layers at %q", r.layerspath())
 	}
@@ -963,31 +1084,20 @@ func (r *layerStore) Delete(id string) error {
 		return ErrLayerUnknown
 	}
 	id = layer.ID
-	// The layer may already have been explicitly unmounted, but if not, we
-	// should try to clean that up before we start deleting anything at the
-	// driver level.
-	mountCount, err := r.Mounted(id)
-	if err != nil {
-		return errors.Wrapf(err, "error checking if layer %q is still mounted", id)
-	}
-	for mountCount > 0 {
-		if _, err := r.Unmount(id, false); err != nil {
-			return err
-		}
-		mountCount, err = r.Mounted(id)
-		if err != nil {
-			return errors.Wrapf(err, "error checking if layer %q is still mounted", id)
-		}
-	}
-	err = r.driver.Remove(id)
+	err := r.driver.Remove(id)
 	if err == nil {
 		os.Remove(r.tspath(id))
+		os.RemoveAll(r.datadir(id))
 		delete(r.byid, id)
+		for _, name := range layer.Names {
+			delete(r.byname, name)
+		}
 		r.idindex.Delete(id)
 		mountLabel := layer.MountLabel
 		if layer.MountPoint != "" {
 			delete(r.bymount, layer.MountPoint)
 		}
+		r.deleteInDigestMap(id)
 		toDeleteIndex := -1
 		for i, candidate := range r.layers {
 			if candidate.ID == id {
@@ -1015,11 +1125,57 @@ func (r *layerStore) Delete(id string) error {
 				label.ReleaseLabel(mountLabel)
 			}
 		}
-		if err = r.Save(); err != nil {
-			return err
-		}
 	}
 	return err
+}
+
+func (r *layerStore) deleteInDigestMap(id string) {
+	for digest, layers := range r.bycompressedsum {
+		for i, layerID := range layers {
+			if layerID == id {
+				layers = append(layers[:i], layers[i+1:]...)
+				r.bycompressedsum[digest] = layers
+				break
+			}
+		}
+	}
+	for digest, layers := range r.byuncompressedsum {
+		for i, layerID := range layers {
+			if layerID == id {
+				layers = append(layers[:i], layers[i+1:]...)
+				r.byuncompressedsum[digest] = layers
+				break
+			}
+		}
+	}
+}
+
+func (r *layerStore) Delete(id string) error {
+	layer, ok := r.lookup(id)
+	if !ok {
+		return ErrLayerUnknown
+	}
+	id = layer.ID
+	// The layer may already have been explicitly unmounted, but if not, we
+	// should try to clean that up before we start deleting anything at the
+	// driver level.
+	mountCount, err := r.Mounted(id)
+	if err != nil {
+		return errors.Wrapf(err, "error checking if layer %q is still mounted", id)
+	}
+	for mountCount > 0 {
+		if _, err := r.Unmount(id, false); err != nil {
+			return err
+		}
+		mountCount, err = r.Mounted(id)
+		if err != nil {
+			return errors.Wrapf(err, "error checking if layer %q is still mounted", id)
+		}
+	}
+	if err := r.deleteInternal(id); err != nil {
+		return err
+	}
+	return r.Save()
 }
 
 func (r *layerStore) Lookup(name string) (id string, err error) {
@@ -1257,6 +1413,7 @@ func (r *layerStore) ApplyDiff(to string, diff io.Reader) (size int64, err error
 	if err != nil {
 		return -1, err
 	}
+	defer uncompressed.Close()
 	uncompressedDigest := digest.Canonical.Digester()
 	uncompressedCounter := ioutils.NewWriteCounter(uncompressedDigest.Hash())
 	uidLog := make(map[uint32]struct{})
@@ -1270,6 +1427,7 @@ func (r *layerStore) ApplyDiff(to string, diff io.Reader) (size int64, err error
 	if err != nil {
 		return -1, err
 	}
+	defer idLogger.Close()
 	payload, err := asm.NewInputTarStream(io.TeeReader(uncompressed, io.MultiWriter(uncompressedCounter, idLogger)), metadata, storage.NewDiscardFilePutter())
 	if err != nil {
 		return -1, err
@@ -1284,7 +1442,6 @@ func (r *layerStore) ApplyDiff(to string, diff io.Reader) (size int64, err error
 		return -1, err
 	}
 	compressor.Close()
-	idLogger.Close()
 	if err == nil {
 		if err := os.MkdirAll(filepath.Dir(r.tspath(layer.ID)), 0700); err != nil {
 			return -1, err

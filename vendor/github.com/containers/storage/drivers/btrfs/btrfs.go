@@ -26,7 +26,8 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/containers/storage/drivers"
+	graphdriver "github.com/containers/storage/drivers"
+	"github.com/containers/storage/pkg/directory"
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/pkg/mount"
 	"github.com/containers/storage/pkg/parsers"
@@ -37,6 +38,8 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
+
+const defaultPerms = os.FileMode(0555)
 
 func init() {
 	graphdriver.Register("btrfs", Init)
@@ -422,7 +425,7 @@ func subvolLimitQgroup(path string, size uint64) error {
 
 // subvolQgroupStatus performs a BTRFS_IOC_TREE_SEARCH on the root path
 // with search key of BTRFS_QGROUP_STATUS_KEY.
-// In case qgroup is enabled, the retuned key type will match BTRFS_QGROUP_STATUS_KEY.
+// In case qgroup is enabled, the returned key type will match BTRFS_QGROUP_STATUS_KEY.
 // For more details please see https://github.com/kdave/btrfs-progs/blob/v4.9/qgroup.c#L1035
 func subvolQgroupStatus(path string) error {
 	dir, err := openDir(path)
@@ -514,6 +517,9 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 	}
 	if parent == "" {
 		if err := subvolCreate(subvolumes, id); err != nil {
+			return err
+		}
+		if err := os.Chmod(path.Join(subvolumes, id), defaultPerms); err != nil {
 			return err
 		}
 	} else {
@@ -627,7 +633,12 @@ func (d *Driver) Remove(id string) error {
 	d.updateQuotaStatus()
 
 	if err := subvolDelete(d.subvolumesDir(), id, d.quotaEnabled); err != nil {
-		return err
+		if d.quotaEnabled {
+			return err
+		}
+		// If quota is not enabled, fallback to rmdir syscall to delete subvolumes.
+		// This would allow unprivileged user to delete their owned subvolumes
+		// in kernel >= 4.18 without user_subvol_rm_alowed mount option.
 	}
 	if err := system.EnsureRemoveAll(dir); err != nil {
 		return err
@@ -680,6 +691,12 @@ func (d *Driver) Put(id string) error {
 	// Get() creates no runtime resources (like e.g. mounts)
 	// so this doesn't need to do anything.
 	return nil
+}
+
+// ReadWriteDiskUsage returns the disk usage of the writable directory for the ID.
+// For BTRFS, it queries the subvolumes path for this ID.
+func (d *Driver) ReadWriteDiskUsage(id string) (*directory.DiskUsage, error) {
+	return directory.Usage(d.subvolumesDirID(id))
 }
 
 // Exists checks if the id exists in the filesystem.
